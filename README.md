@@ -39,7 +39,7 @@ Latent 16D  Latent 16D  ──→ PCA → Pareto Recovery
 
 ## Pipeline Structure
 
-The pipeline is organized into 6 sequential phase files designed to run on Kaggle with T4 GPU:
+The pipeline is organized into 6 sequential phase files designed to run on Kaggle with CPU/GPU P100:
 
 | Phase | File | Description | Output | Runtime |
 |-------|------|-------------|--------|---------|
@@ -104,6 +104,13 @@ The pipeline expects the [emibetuzumab dataset](https://www.nature.com/articles/
 - `igg_binding.csv`, `igg_reps.csv` — IgG continuous measurements
 - `residue_dict.csv` — Residue mapping
 - `emi_pl.txt`, `iso_pl.txt`, `igg_pl.txt` — Full sequences for ESM-2
+
+### Compute Environment
+
+All experiments were conducted on [Kaggle](https://www.kaggle.com/) notebooks using:
+- **GPU**: NVIDIA Tesla P100 (16 GB VRAM) for model training (Phases 2–5)
+- **CPU**: ESM-2 embedding computation (Phase 1) runs on CPU to avoid CUDA kernel mismatch
+- **Total runtime**: ~13 hours end-to-end
 
 ## Feature Representations
 
