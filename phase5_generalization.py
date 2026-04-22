@@ -8,12 +8,12 @@ Requires: features.pkl (Phase 1), baselines.pkl (Phase 2)
 Saves: generalization.pkl (Spearman + Pareto results)
 Runtime: ~30 min
 """
-# Auto-import: works both as .py file AND pasted into notebook cells
+# Auto-import: works when phases are run as local scripts
 try:
     config  # Already loaded if Phase 0 ran in this kernel
 except NameError:
     import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else "/kaggle/working")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd())
     from phase0_config import *
 
 def predict_model(model, X):

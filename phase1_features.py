@@ -7,12 +7,12 @@ builds OneHot + ESM2 + Fusion-ESM2 features for all datasets.
 Saves: features.pkl (~50MB)
 Runtime: ~5 min (first run with ESM-2), <30s (cached)
 """
-# Auto-import: works both as .py file AND pasted into notebook cells
+# Auto-import: works when phases are run as local scripts
 try:
     config  # Already loaded if Phase 0 ran in this kernel
 except NameError:
     import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else "/kaggle/working")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd())
     from phase0_config import *
 
 def _compute_esm2_embeddings(sequences, esm_model, alphabet, batch_converter, device, embed_layer=6, batch_size=64):

@@ -82,8 +82,9 @@ DEVICE = get_device()
 # CONFIGURATION
 # ============================================================================
 class Config:
-    DATA_PATH = os.environ.get("MOLM_DATA_PATH", "/kaggle/input/datasets/iamdiganta7/antibody")
-    OUTPUT_DIR = os.environ.get("MOLM_OUTPUT_DIR", "/kaggle/working/molm_pipeline_results")
+    PROJECT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    DATA_PATH = os.environ.get("MOLM_DATA_PATH", os.path.join(PROJECT_DIR, "data"))
+    OUTPUT_DIR = os.environ.get("MOLM_OUTPUT_DIR", os.path.join(PROJECT_DIR, "outputs"))
     
     RUN_LDA_BASELINES = True
     RUN_NN_BASELINES = True
@@ -134,7 +135,7 @@ class Config:
     FEATURE_TYPES = ['onehot', 'esm2', 'fusion_esm2']
     GRID_FEATURE_TYPES = ['onehot', 'esm2', 'fusion_esm2']
     
-    ESM2_DIR = "/kaggle/working"
+    ESM2_DIR = os.environ.get("MOLM_ESM2_DIR", os.path.join(OUTPUT_DIR, "esm2"))
     ESM2_DIM = 320
     USE_ESM2 = True
     
@@ -149,6 +150,7 @@ class Config:
 
 config = Config()
 os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+os.makedirs(config.ESM2_DIR, exist_ok=True)
 
 # Feature label mapping (used across all phases)
 FEAT_LABELS = {

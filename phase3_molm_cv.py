@@ -7,12 +7,12 @@ Requires: features.pkl (from Phase 1)
 Saves: molm_cv.pkl (CV results for all feature types)
 Runtime: ~2 hours (3 features × MOLM + MOLM-ST × 5 folds × 25 epochs)
 """
-# Auto-import: works both as .py file AND pasted into notebook cells
+# Auto-import: works when phases are run as local scripts
 try:
     config  # Already loaded if Phase 0 ran in this kernel
 except NameError:
     import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else "/kaggle/working")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd())
     from phase0_config import *
 
 def export_epoch_diagnostics_csv(trainer, save_path):

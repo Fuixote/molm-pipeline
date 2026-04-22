@@ -39,7 +39,7 @@ Latent 16D  Latent 16D  ──→ PCA → Pareto Recovery
 
 ## Pipeline Structure
 
-The pipeline is organized into 6 sequential phase files designed to run on Kaggle with CPU/GPU P100:
+The pipeline is organized into 6 sequential phase files designed to run locally with CPU or CUDA:
 
 | Phase | File | Description | Output | Runtime |
 |-------|------|-------------|--------|---------|
@@ -55,48 +55,46 @@ The pipeline is organized into 6 sequential phase files designed to run on Kaggl
 ### Requirements
 
 - Python 3.10+
-- TensorFlow 2.x
+- PyTorch
 - scikit-learn
 - NumPy, Pandas
+- SciPy, Matplotlib, Seaborn
 - `fair-esm` (for ESM-2 embeddings)
 
-### Running on Kaggle
+### Local Configuration
 
-```python
-# Cell 1: Load config
-%run phase0_config.py
+By default, the pipeline reads input data from `./data`, writes outputs to `./outputs`, and caches ESM-2 embeddings in `./outputs/esm2`.
 
-# Cell 2: Force ESM-2 to CPU (avoids CUDA kernel mismatch on Kaggle)
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+You can override those locations with environment variables:
 
-# Cell 3: Compute features
-%run phase1_features.py
+```bash
+export MOLM_DATA_PATH=/path/to/antibody_data
+export MOLM_OUTPUT_DIR=/path/to/molm_outputs
+export MOLM_ESM2_DIR=/path/to/esm2_cache
+```
 
-# Cell 4: Restore GPU for training
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+### Running Locally
 
-# Cell 5: Run baselines
-%run phase2_baselines.py
+Run the phases from the repository directory:
 
-# Cell 6: Run MOLM cross-validation
-%run phase3_molm_cv.py
+```bash
+python phase0_config.py
+python phase1_features.py
+python phase2_baselines.py
+python phase3_molm_cv.py
+python phase4_holdout.py
+python phase5_generalization.py
+```
 
-# Cell 7: Run holdout evaluation
-%run phase4_holdout.py
+To validate the migrated PyTorch model:
 
-# Cell 8: Free memory before generalization
-import gc, tensorflow as tf
-tf.keras.backend.clear_session()
-gc.collect()
-
-# Cell 9: Run generalization + Pareto analysis
-%run phase5_generalization.py
+```bash
+python tests/validate_diagnostic_molm_torch.py
 ```
 
 ### Dataset
 
-The pipeline expects the [emibetuzumab dataset](https://www.nature.com/articles/s41467-022-31457-3) files in the Kaggle input directory:
+The pipeline expects the [emibetuzumab dataset](https://www.nature.com/articles/s41467-022-31457-3) files in `MOLM_DATA_PATH`:
 
 - `emi_binding.csv` — EMI binary labels
 - `emi_reps.csv` — EMI sequence representations
@@ -107,10 +105,7 @@ The pipeline expects the [emibetuzumab dataset](https://www.nature.com/articles/
 
 ### Compute Environment
 
-All experiments were conducted on [Kaggle](https://www.kaggle.com/) notebooks using:
-- **GPU**: NVIDIA Tesla P100 (16 GB VRAM) for model training (Phases 2–5)
-- **CPU**: ESM-2 embedding computation (Phase 1) runs on CPU to avoid CUDA kernel mismatch
-- **Total runtime**: ~13 hours end-to-end
+The PyTorch pipeline runs on CPU or CUDA. End-to-end runtime depends on local hardware and whether ESM-2 embeddings are already cached.
 
 ## Feature Representations
 
