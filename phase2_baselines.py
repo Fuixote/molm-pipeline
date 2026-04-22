@@ -52,25 +52,24 @@ def train_lda_baselines(X, y_aff, y_spec, feature_name, n_folds=None):
 def train_nn_baseline_cv(X, y, n_folds=5, epochs=50, batch_size=50, intermed_dim=20):
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=SEED)
     accs, mccs, aucs = [], [], []
-    loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     
     for fold, (tr, te) in enumerate(skf.split(X, y)):
         hard_reset_rng(SEED + fold, f"NN fold {fold}")
-        model = DeepProjectorDecider(input_dim=X.shape[1], intermed_dim=intermed_dim)
-        model.compile(optimizer='adam', loss=loss_fn)
-        model.fit(X[tr], y[tr], batch_size=batch_size, epochs=epochs, shuffle=True, verbose=0)
-        logits = model(X[te]).numpy()
+        model = train_deep_projector_decider(
+            X[tr], y[tr], input_dim=X.shape[1], intermed_dim=intermed_dim,
+            epochs=epochs, batch_size=batch_size, seed=SEED + fold)
+        logits = predict_deep_projector_logits(model, X[te])
         preds = np.argmax(logits, 1)
-        probs = tf.nn.softmax(logits, axis=1).numpy()[:, 1]  # P(class=1)
+        probs = torch.softmax(torch.as_tensor(logits), dim=1).numpy()[:, 1]  # P(class=1)
         accs.append((preds == y[te]).mean())
         mccs.append(safe_mcc(y[te], preds))
         aucs.append(safe_auc(y[te], probs))
-        del model; tf.keras.backend.clear_session()
+        del model; gc.collect(); torch.cuda.empty_cache()
     
     hard_reset_rng(SEED + 999, "NN final")
-    final = DeepProjectorDecider(input_dim=X.shape[1], intermed_dim=intermed_dim)
-    final.compile(optimizer='adam', loss=loss_fn)
-    final.fit(X, y, batch_size=batch_size, epochs=epochs, shuffle=True, verbose=0)
+    final = train_deep_projector_decider(
+        X, y, input_dim=X.shape[1], intermed_dim=intermed_dim,
+        epochs=epochs, batch_size=batch_size, seed=SEED + 999)
     
     return {'cv_mean': np.mean(accs), 'cv_std': np.std(accs), 'cv_scores': accs,
             'mcc_mean': np.nanmean(mccs), 'mcc_std': np.nanstd(mccs),

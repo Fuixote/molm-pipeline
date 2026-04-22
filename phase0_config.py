@@ -14,9 +14,7 @@ import os
 import random
 
 os.environ["PYTHONHASHSEED"] = "42"
-os.environ["TF_DETERMINISTIC_OPS"] = "1"
-os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 # ============================================================================
 # IMPORTS
@@ -24,18 +22,12 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import gc
 gc.collect()
 
-try:
-    import tensorflow as tf
-    tf.keras.backend.clear_session()
-    del tf
-except:
-    pass
-
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, Model
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import KFold, StratifiedKFold, cross_validate as cv
 from sklearn.model_selection import cross_val_predict
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
@@ -66,43 +58,32 @@ import pickle
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
-tf.keras.utils.set_random_seed(SEED)
-
-try:
-    tf.config.experimental.enable_op_determinism()
-except:
-    pass
-
-tf.keras.backend.clear_session()
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.cuda.empty_cache()
+torch.use_deterministic_algorithms(True)
 gc.collect()
 
 warnings.filterwarnings('ignore')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-tf.get_logger().setLevel('ERROR')
 
 plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_palette("husl")
 
 # ============================================================================
-# GPU SETUP
+# DEVICE SETUP
 # ============================================================================
-gpus = tf.config.list_physical_devices('GPU')
-if len(gpus) > 0:
-    tf.config.set_visible_devices(gpus[0], 'GPU')
-    try:
-        tf.config.experimental.set_memory_growth(gpus[0], True)
-    except:
-        pass
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-tf.keras.mixed_precision.set_global_policy("float32")
-tf.config.optimizer.set_jit(False)
+DEVICE = get_device()
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 class Config:
-    DATA_PATH = "/kaggle/input/datasets/iamdiganta7/antibody"
-    OUTPUT_DIR = "/kaggle/working/molm_pipeline_results"
+    DATA_PATH = os.environ.get("MOLM_DATA_PATH", "/kaggle/input/datasets/iamdiganta7/antibody")
+    OUTPUT_DIR = os.environ.get("MOLM_OUTPUT_DIR", "/kaggle/working/molm_pipeline_results")
     
     RUN_LDA_BASELINES = True
     RUN_NN_BASELINES = True
@@ -215,8 +196,10 @@ logger = DebugLogger(os.path.join(config.OUTPUT_DIR, "debug_log.txt"))
 def hard_reset_rng(seed, context=""):
     random.seed(seed)
     np.random.seed(seed)
-    tf.keras.utils.set_random_seed(seed)
-    tf.keras.backend.clear_session()
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.cuda.empty_cache()
     gc.collect()
     if config.DEBUG_MODE:
         logger.log(f"🔄 RNG Reset: seed={seed} ({context})")
@@ -290,62 +273,73 @@ def create_holdout_indices(sequences, site_idx, residue, mode='top'):
 # ============================================================================
 # LOSS FUNCTIONS
 # ============================================================================
+def as_torch_float(x, device=None):
+    if torch.is_tensor(x):
+        tensor = x.float()
+    else:
+        tensor = torch.as_tensor(x, dtype=torch.float32)
+    if device is not None:
+        tensor = tensor.to(device)
+    return tensor
+
 def focal_bce_with_logits(y_true, logit, gamma=2.0, pos_weight=1.0):
-    y_true = tf.cast(y_true, tf.float32)
-    logit = tf.cast(logit, tf.float32)
-    bce = tf.nn.weighted_cross_entropy_with_logits(labels=y_true, logits=logit, pos_weight=pos_weight)
-    p = tf.sigmoid(logit)
+    logit = as_torch_float(logit)
+    y_true = as_torch_float(y_true, device=logit.device)
+    pos_weight = torch.as_tensor(pos_weight, dtype=logit.dtype, device=logit.device)
+    bce = F.binary_cross_entropy_with_logits(logit, y_true, pos_weight=pos_weight, reduction='none')
+    p = torch.sigmoid(logit)
     p_t = y_true * p + (1 - y_true) * (1 - p)
-    return tf.reduce_mean(tf.pow(1.0 - p_t, gamma) * bce)
+    return ((1.0 - p_t).pow(gamma) * bce).mean()
 
 def safe_gap(scores, labels):
-    scores = tf.cast(scores, tf.float32)
-    labels = tf.cast(labels, tf.float32)
+    scores = as_torch_float(scores)
+    labels = as_torch_float(labels, device=scores.device)
     pos_mask = labels > 0.5
     neg_mask = labels < 0.5
-    n_pos = tf.reduce_sum(tf.cast(pos_mask, tf.float32))
-    n_neg = tf.reduce_sum(tf.cast(neg_mask, tf.float32))
-    def compute():
-        return tf.reduce_mean(tf.boolean_mask(scores, pos_mask)) - tf.reduce_mean(tf.boolean_mask(scores, neg_mask))
-    return tf.cond(tf.logical_and(n_pos > 0, n_neg > 0), compute, lambda: tf.constant(0.0, tf.float32))
+    if pos_mask.sum().item() > 0 and neg_mask.sum().item() > 0:
+        return scores[pos_mask].mean() - scores[neg_mask].mean()
+    return scores.new_tensor(0.0)
 
 def gap_hinge_loss(scores, labels, margin=0.2):
-    scores = tf.cast(scores, tf.float32)
-    labels = tf.cast(labels, tf.float32)
+    scores = as_torch_float(scores)
+    labels = as_torch_float(labels, device=scores.device)
     pos_mask = labels > 0.5
     neg_mask = labels < 0.5
-    n_pos = tf.reduce_sum(tf.cast(pos_mask, tf.float32))
-    n_neg = tf.reduce_sum(tf.cast(neg_mask, tf.float32))
-    def compute():
-        gap = tf.reduce_mean(tf.boolean_mask(scores, pos_mask)) - tf.reduce_mean(tf.boolean_mask(scores, neg_mask))
-        return tf.nn.relu(margin - gap)
-    return tf.cond(tf.logical_and(n_pos > 0, n_neg > 0), compute, lambda: 0.0)
+    n_pos = pos_mask.sum()
+    n_neg = neg_mask.sum()
+    if n_pos.item() > 0 and n_neg.item() > 0:
+        gap = scores[pos_mask].mean() - scores[neg_mask].mean()
+        return torch.clamp(margin - gap, min=0.0)
+    return scores.new_tensor(0.0)
 
 def ranking_loss(scores, labels, margin=0.3):
-    scores = tf.cast(scores, tf.float32)
-    labels = tf.cast(labels, tf.float32)
+    scores = as_torch_float(scores)
+    labels = as_torch_float(labels, device=scores.device)
     pos_mask = labels > 0.5
     neg_mask = labels < 0.5
-    n_pos = tf.reduce_sum(tf.cast(pos_mask, tf.float32))
-    n_neg = tf.reduce_sum(tf.cast(neg_mask, tf.float32))
-    def compute():
-        pos_sc = tf.boolean_mask(scores, pos_mask)
-        neg_sc = tf.boolean_mask(scores, neg_mask)
-        diff = tf.expand_dims(pos_sc, 1) - tf.expand_dims(neg_sc, 0)
-        return tf.reduce_mean(tf.maximum(0.0, margin - diff))
-    return tf.cond(tf.logical_and(n_pos > 0, n_neg > 0), compute, lambda: 0.0)
+    n_pos = pos_mask.sum()
+    n_neg = neg_mask.sum()
+    if n_pos.item() > 0 and n_neg.item() > 0:
+        pos_sc = scores[pos_mask]
+        neg_sc = scores[neg_mask]
+        diff = pos_sc.unsqueeze(1) - neg_sc.unsqueeze(0)
+        return torch.clamp(margin - diff, min=0.0).mean()
+    return scores.new_tensor(0.0)
 
 def adversarial_loss(disc_pred_aff, disc_pred_spec):
-    loss_aff = tf.keras.losses.binary_crossentropy(tf.ones_like(disc_pred_aff), disc_pred_aff)
-    loss_spec = tf.keras.losses.binary_crossentropy(tf.zeros_like(disc_pred_spec), disc_pred_spec)
-    return tf.reduce_mean(loss_aff) + tf.reduce_mean(loss_spec)
+    disc_pred_aff = as_torch_float(disc_pred_aff)
+    disc_pred_spec = as_torch_float(disc_pred_spec, device=disc_pred_aff.device)
+    loss_aff = F.binary_cross_entropy(disc_pred_aff, torch.ones_like(disc_pred_aff))
+    loss_spec = F.binary_cross_entropy(disc_pred_spec, torch.zeros_like(disc_pred_spec))
+    return loss_aff + loss_spec
 
 def independence_loss(z1, z2):
-    z1 = tf.cast(z1, tf.float32); z2 = tf.cast(z2, tf.float32)
-    z1_n = (z1 - tf.reduce_mean(z1, 0, True)) / (tf.math.reduce_std(z1, 0, True) + 1e-6)
-    z2_n = (z2 - tf.reduce_mean(z2, 0, True)) / (tf.math.reduce_std(z2, 0, True) + 1e-6)
-    corr = tf.matmul(z1_n, z2_n, transpose_a=True) / tf.cast(tf.shape(z1)[0], tf.float32)
-    return tf.reduce_mean(tf.square(corr))
+    z1 = as_torch_float(z1)
+    z2 = as_torch_float(z2, device=z1.device)
+    z1_n = (z1 - z1.mean(dim=0, keepdim=True)) / (z1.std(dim=0, keepdim=True, unbiased=False) + 1e-6)
+    z2_n = (z2 - z2.mean(dim=0, keepdim=True)) / (z2.std(dim=0, keepdim=True, unbiased=False) + 1e-6)
+    corr = torch.matmul(z1_n.T, z2_n) / z1.shape[0]
+    return corr.square().mean()
 
 def pareto_diversity_loss(aff_scores, spec_scores):
     """
@@ -360,33 +354,37 @@ def pareto_diversity_loss(aff_scores, spec_scores):
     
     Returns: scalar loss to MINIMIZE (higher = worse Pareto spread)
     """
-    aff_p = tf.sigmoid(tf.cast(aff_scores, tf.float32))
-    spec_p = tf.sigmoid(tf.cast(spec_scores, tf.float32))
+    aff_scores = as_torch_float(aff_scores)
+    spec_scores = as_torch_float(spec_scores, device=aff_scores.device)
+    aff_p = torch.sigmoid(aff_scores)
+    spec_p = torch.sigmoid(spec_scores)
     
     # 1. Spread: penalize low variance in either dimension
-    spread_aff = tf.math.reduce_std(aff_p)
-    spread_spec = tf.math.reduce_std(spec_p)
-    spread_loss = -tf.math.log(spread_aff + 1e-6) - tf.math.log(spread_spec + 1e-6)
+    spread_aff = aff_p.std(unbiased=False)
+    spread_spec = spec_p.std(unbiased=False)
+    spread_loss = -torch.log(spread_aff + 1e-6) - torch.log(spread_spec + 1e-6)
     
     # 2. Decorrelation: penalize positive correlation between scores
     # We want: some seqs high-aff/low-spec, some low-aff/high-spec
-    aff_c = aff_p - tf.reduce_mean(aff_p)
-    spec_c = spec_p - tf.reduce_mean(spec_p)
-    corr = tf.reduce_sum(aff_c * spec_c) / (
-        tf.norm(aff_c) * tf.norm(spec_c) + 1e-8)
-    decorr_loss = tf.nn.relu(corr)  # Only penalize POSITIVE correlation
+    aff_c = aff_p - aff_p.mean()
+    spec_c = spec_p - spec_p.mean()
+    corr = (aff_c * spec_c).sum() / (torch.norm(aff_c) * torch.norm(spec_c) + 1e-8)
+    decorr_loss = torch.clamp(corr, min=0.0)  # Only penalize POSITIVE correlation
     
     # 3. Frontier coverage: encourage diverse tradeoff ratios
     # Angle in (aff, spec) space — want uniform spread of angles
-    angles = tf.atan2(spec_p - tf.reduce_mean(spec_p), aff_p - tf.reduce_mean(aff_p))
-    angle_std = tf.math.reduce_std(angles)
-    coverage_loss = -tf.math.log(angle_std + 1e-6)
+    angles = torch.atan2(spec_p - spec_p.mean(), aff_p - aff_p.mean())
+    angle_std = angles.std(unbiased=False)
+    coverage_loss = -torch.log(angle_std + 1e-6)
     
     return spread_loss + decorr_loss + 0.5 * coverage_loss
 
 def tfp_correlation(x, y):
-    x = x - tf.reduce_mean(x); y = y - tf.reduce_mean(y)
-    return tf.reduce_sum(x * y) / (tf.norm(x) * tf.norm(y) + 1e-8)
+    x = as_torch_float(x).reshape(-1)
+    y = as_torch_float(y, device=x.device).reshape(-1)
+    x = x - x.mean()
+    y = y - y.mean()
+    return (x * y).sum() / (torch.norm(x) * torch.norm(y) + 1e-8)
 
 # ============================================================================
 # METRIC UTILITIES
@@ -476,39 +474,34 @@ class EpochDiagnostics:
     igg_aff_rho: Optional[float] = None; igg_spec_rho: Optional[float] = None
 
 # ============================================================================
-# MODEL: GRL + MCDropout
+# MODEL: Gradient Reversal
 # ============================================================================
-@tf.custom_gradient
-def gradient_reversal_func(x, lambd):
-    def grad(dy):
-        return -tf.cast(lambd, dy.dtype) * dy, None
-    return x, grad
+class GradientReversal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.save_for_backward(torch.tensor(alpha))
+        return x.clone()
 
-@tf.keras.utils.register_keras_serializable()
-class GradientReversalLayer(layers.Layer):
-    def __init__(self, lambd=1.0, **kwargs):
-        super().__init__(**kwargs)
-        self.lambd = lambd
-    def call(self, x):
-        return gradient_reversal_func(x, self.lambd)
-    def get_config(self):
-        base = super().get_config()
-        base['lambd'] = self.lambd
-        return base
+    @staticmethod
+    def backward(ctx, grad_output):
+        alpha, = ctx.saved_tensors
+        return -alpha * grad_output, None
 
-@tf.keras.utils.register_keras_serializable()
-class MCDropout(layers.Dropout):
-    def call(self, inputs, training=None):
-        return super().call(inputs, training=training)
+class GradientReversalLayer(nn.Module):
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        return GradientReversal.apply(x, self.alpha)
 
 # ============================================================================
 # MODEL: DiagnosticMOLM
 # ============================================================================
-@tf.keras.utils.register_keras_serializable()
-class DiagnosticMOLM(Model):
+class DiagnosticMOLM(nn.Module):
     def __init__(self, input_dim, latent_dim=16, shared_dims=[256, 128],
                  tower_dims=[64, 32], dropout_rate=0.2, grl_lambda=1.0, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.grl_lambda = grl_lambda
@@ -516,168 +509,282 @@ class DiagnosticMOLM(Model):
         self._tower_dims = list(tower_dims)
         self._dropout_rate = dropout_rate
         
-        self.shared_layers = []
-        for i, dim in enumerate(shared_dims):
-            self.shared_layers.append(layers.Dense(dim, name=f'shared_dense_{i}'))
-            self.shared_layers.append(layers.LayerNormalization(name=f'shared_ln_{i}'))
-            self.shared_layers.append(MCDropout(dropout_rate, name=f'shared_drop_{i}'))
+        self.shared_layers = self._make_blocks(input_dim, shared_dims, dropout_rate)
         
-        self.grl = GradientReversalLayer(lambd=grl_lambda)
-        self.disc_dense1 = layers.Dense(32, activation='gelu', name='disc_dense1')
-        self.disc_dense2 = layers.Dense(16, activation='gelu', name='disc_dense2')
-        self.disc_out = layers.Dense(1, activation='sigmoid', name='disc_out', dtype='float32')
+        self.discriminator = nn.Sequential(
+            GradientReversalLayer(alpha=grl_lambda),
+            nn.Linear(latent_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid(),
+        )
         
-        self.aff_layers = []
-        for i, dim in enumerate(tower_dims):
-            self.aff_layers.append(layers.Dense(dim, name=f'aff_dense_{i}'))
-            self.aff_layers.append(layers.LayerNormalization(name=f'aff_ln_{i}'))
-            self.aff_layers.append(MCDropout(dropout_rate, name=f'aff_drop_{i}'))
-        self.aff_proj = layers.Dense(latent_dim, name='aff_proj')
-        self.aff_proj_norm = layers.LayerNormalization(name='aff_proj_norm')
+        shared_out_dim = shared_dims[-1] if shared_dims else input_dim
+        tower_out_dim = tower_dims[-1] if tower_dims else shared_out_dim
+
+        self.aff_layers = self._make_blocks(shared_out_dim, tower_dims, dropout_rate)
+        self.aff_proj = nn.Linear(tower_out_dim, latent_dim)
+        self.aff_proj_norm = nn.LayerNorm(latent_dim)
         
-        self.spec_layers = []
-        for i, dim in enumerate(tower_dims):
-            self.spec_layers.append(layers.Dense(dim, name=f'spec_dense_{i}'))
-            self.spec_layers.append(layers.LayerNormalization(name=f'spec_ln_{i}'))
-            self.spec_layers.append(MCDropout(dropout_rate, name=f'spec_drop_{i}'))
-        self.spec_proj = layers.Dense(latent_dim, name='spec_proj')
-        self.spec_proj_norm = layers.LayerNormalization(name='spec_proj_norm')
+        self.spec_layers = self._make_blocks(shared_out_dim, tower_dims, dropout_rate)
+        self.spec_proj = nn.Linear(tower_out_dim, latent_dim)
+        self.spec_proj_norm = nn.LayerNorm(latent_dim)
         
-        self.aff_head = layers.Dense(1, name='aff_head', dtype='float32')
-        self.spec_head = layers.Dense(1, name='spec_head', dtype='float32')
+        self.aff_head = nn.Linear(latent_dim, 1)
+        self.spec_head = nn.Linear(latent_dim, 1)
+        self.to(get_device())
+
+    @staticmethod
+    def _make_blocks(input_dim, dims, dropout_rate):
+        blocks = nn.ModuleList()
+        prev_dim = input_dim
+        for dim in dims:
+            blocks.append(nn.Linear(prev_dim, dim))
+            blocks.append(nn.LayerNorm(dim))
+            blocks.append(nn.Dropout(dropout_rate))
+            prev_dim = dim
+        return blocks
+
+    def _coerce_input(self, inputs):
+        device = next(self.parameters()).device
+        if torch.is_tensor(inputs):
+            return inputs.to(device=device, dtype=torch.float32)
+        return torch.as_tensor(inputs, dtype=torch.float32, device=device)
+
+    @staticmethod
+    def _apply_dropout(layer, x, training):
+        if training is None:
+            return layer(x)
+        return F.dropout(x, p=layer.p, training=training)
     
     def run_shared(self, x, training):
-        for i in range(0, len(self.shared_layers), 3):
-            x = self.shared_layers[i](x)
-            x = self.shared_layers[i+1](x)
-            x = tf.nn.gelu(x)
-            x = self.shared_layers[i+2](x, training=training)
-        return x
+        return self._run_blocks(x, self.shared_layers, training)
     
     def run_tower(self, x, tower_layers, proj, proj_norm, training):
-        for i in range(0, len(tower_layers), 3):
-            x = tower_layers[i](x)
-            x = tower_layers[i+1](x)
-            x = tf.nn.gelu(x)
-            x = tower_layers[i+2](x, training=training)
+        x = self._run_blocks(x, tower_layers, training)
         return proj_norm(proj(x))
+
+    def _run_blocks(self, x, blocks, training):
+        for i in range(0, len(blocks), 3):
+            x = blocks[i](x)
+            x = blocks[i+1](x)
+            x = F.gelu(x)
+            x = self._apply_dropout(blocks[i+2], x, training)
+        return x
     
     def run_discriminator(self, x):
-        return self.disc_out(self.disc_dense2(self.disc_dense1(tf.cast(x, tf.float32))))
+        return self.discriminator(x.float())
     
-    def call(self, inputs, training=None):
+    def forward(self, inputs, training=None):
+        inputs = self._coerce_input(inputs)
         shared = self.run_shared(inputs, training)
         aff_latent = self.run_tower(shared, self.aff_layers, self.aff_proj, self.aff_proj_norm, training)
         spec_latent = self.run_tower(shared, self.spec_layers, self.spec_proj, self.spec_proj_norm, training)
-        aff_logit = tf.squeeze(self.aff_head(aff_latent), -1)
-        spec_logit = tf.squeeze(self.spec_head(spec_latent), -1)
+        aff_logit = self.aff_head(aff_latent).squeeze(-1)
+        spec_logit = self.spec_head(spec_latent).squeeze(-1)
         return {
+            'logit_aff': aff_logit, 'logit_spec': spec_logit,
+            'z_aff': aff_latent, 'z_spec': spec_latent,
             'aff_score': aff_logit, 'spec_score': spec_logit,
-            'aff_prob': tf.sigmoid(tf.cast(aff_logit, tf.float32)),
-            'spec_prob': tf.sigmoid(tf.cast(spec_logit, tf.float32)),
+            'aff_prob': torch.sigmoid(aff_logit.float()),
+            'spec_prob': torch.sigmoid(spec_logit.float()),
             'aff_latent': aff_latent, 'spec_latent': spec_latent,
-            'aff_latent_grl': self.grl(aff_latent),
-            'spec_latent_grl': self.grl(spec_latent),
+            'aff_latent_grl': aff_latent,
+            'spec_latent_grl': spec_latent,
             'shared': shared,
         }
     
     def get_config(self):
-        base = super().get_config()
-        base.update({'input_dim': self.input_dim, 'latent_dim': self.latent_dim,
-                     'grl_lambda': self.grl_lambda, 'shared_dims': self._shared_dims,
-                     'tower_dims': self._tower_dims, 'dropout_rate': self._dropout_rate})
-        return base
+        return {'input_dim': self.input_dim, 'latent_dim': self.latent_dim,
+                'grl_lambda': self.grl_lambda, 'shared_dims': self._shared_dims,
+                'tower_dims': self._tower_dims, 'dropout_rate': self._dropout_rate}
     
     def get_layer_groups(self):
         return {
-            'shared': [l for l in self.shared_layers if hasattr(l, 'trainable_weights')],
-            'aff_tower': self.aff_layers + [self.aff_proj, self.aff_proj_norm],
-            'spec_tower': self.spec_layers + [self.spec_proj, self.spec_proj_norm],
+            'shared': list(self.shared_layers),
+            'aff_tower': list(self.aff_layers) + [self.aff_proj, self.aff_proj_norm],
+            'spec_tower': list(self.spec_layers) + [self.spec_proj, self.spec_proj_norm],
             'aff_head': [self.aff_head], 'spec_head': [self.spec_head],
-            'discriminator': [self.disc_dense1, self.disc_dense2, self.disc_out],
+            'discriminator': list(self.discriminator),
         }
     
     def get_projections(self, inputs):
-        out = self(inputs, training=False)
-        return {'affinity': out['aff_score'].numpy().flatten(),
-                'specificity': out['spec_score'].numpy().flatten()}
+        self.eval()
+        with torch.no_grad():
+            out = self(inputs, training=False)
+        return {'affinity': out['aff_score'].detach().cpu().numpy().flatten(),
+                'specificity': out['spec_score'].detach().cpu().numpy().flatten()}
 
 # ============================================================================
 # TRAINER: DiagnosticTrainer (Multi-Task)
 # ============================================================================
 class DiagnosticTrainer:
     def __init__(self, model, aff_pos_weight=1.0, spec_pos_weight=1.0, learning_rate=5e-5):
-        self.model = model
+        self.device = get_device()
+        self.model = model.to(self.device)
         self.aff_pos_weight = aff_pos_weight
         self.spec_pos_weight = spec_pos_weight
-        self.optimizer = keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=1e-4, clipnorm=1.0)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-4)
         self.epoch_diagnostics = []
         self.history = defaultdict(list)
-    
-    def train_step_with_diagnostics(self, x, y_aff, y_spec):
-        with tf.GradientTape(persistent=True) as tape:
-            out = self.model(x, training=True)
-            loss_cls_aff = focal_bce_with_logits(y_aff, out['aff_score'], config.FOCAL_GAMMA, self.aff_pos_weight)
-            loss_cls_spec = focal_bce_with_logits(y_spec, out['spec_score'], config.FOCAL_GAMMA, self.spec_pos_weight)
-            loss_rank_aff = ranking_loss(out['aff_score'], y_aff, config.RANKING_MARGIN)
-            loss_rank_spec = ranking_loss(out['spec_score'], y_spec, config.RANKING_MARGIN)
-            loss_gap_aff = gap_hinge_loss(out['aff_score'], y_aff, config.GAP_MARGIN)
-            loss_gap_spec = gap_hinge_loss(out['spec_score'], y_spec, config.GAP_MARGIN)
+
+    def _shared_params(self):
+        return [p for p in self.model.shared_layers.parameters() if p.requires_grad]
+
+    @staticmethod
+    def _flatten_grads(grads, params):
+        flat = []
+        for grad, param in zip(grads, params):
+            if grad is None:
+                flat.append(torch.zeros_like(param).reshape(-1))
+            else:
+                flat.append(grad.reshape(-1))
+        if not flat:
+            return torch.zeros(1)
+        return torch.cat(flat)
+
+    @staticmethod
+    def _safe_gap_torch(scores, labels):
+        scores = scores.float()
+        labels = labels.float().to(scores.device)
+        pos_mask = labels > 0.5
+        neg_mask = labels < 0.5
+        if pos_mask.sum().item() > 0 and neg_mask.sum().item() > 0:
+            return scores[pos_mask].mean() - scores[neg_mask].mean()
+        return scores.new_tensor(0.0)
+
+    @staticmethod
+    def _correlation_torch(x, y):
+        x = x.reshape(-1).float()
+        y = y.reshape(-1).float().to(x.device)
+        x = x - x.mean()
+        y = y - y.mean()
+        return (x * y).sum() / (torch.norm(x) * torch.norm(y) + 1e-8)
+
+    @staticmethod
+    def _adversarial_loss_torch(disc_pred_aff, disc_pred_spec):
+        loss_aff = F.binary_cross_entropy(disc_pred_aff, torch.ones_like(disc_pred_aff))
+        loss_spec = F.binary_cross_entropy(disc_pred_spec, torch.zeros_like(disc_pred_spec))
+        return loss_aff + loss_spec
+
+    @staticmethod
+    def _independence_loss_torch(z1, z2):
+        z1 = z1.float()
+        z2 = z2.float().to(z1.device)
+        z1_n = (z1 - z1.mean(dim=0, keepdim=True)) / (z1.std(dim=0, keepdim=True, unbiased=False) + 1e-6)
+        z2_n = (z2 - z2.mean(dim=0, keepdim=True)) / (z2.std(dim=0, keepdim=True, unbiased=False) + 1e-6)
+        corr = torch.matmul(z1_n.T, z2_n) / z1.shape[0]
+        return corr.square().mean()
+
+    @staticmethod
+    def _pareto_diversity_loss_torch(aff_scores, spec_scores):
+        aff_p = torch.sigmoid(aff_scores.float())
+        spec_p = torch.sigmoid(spec_scores.float())
+        spread_loss = -torch.log(aff_p.std(unbiased=False) + 1e-6) - torch.log(spec_p.std(unbiased=False) + 1e-6)
+        aff_c = aff_p - aff_p.mean()
+        spec_c = spec_p - spec_p.mean()
+        corr = (aff_c * spec_c).sum() / (torch.norm(aff_c) * torch.norm(spec_c) + 1e-8)
+        decorr_loss = torch.clamp(corr, min=0.0)
+        angles = torch.atan2(spec_p - spec_p.mean(), aff_p - aff_p.mean())
+        coverage_loss = -torch.log(angles.std(unbiased=False) + 1e-6)
+        return spread_loss + decorr_loss + 0.5 * coverage_loss
+
+    def compute_total_loss(self, out, y_aff, y_spec):
+        loss_cls_aff = focal_bce_with_logits(y_aff, out['aff_score'], config.FOCAL_GAMMA, self.aff_pos_weight)
+        loss_cls_spec = focal_bce_with_logits(y_spec, out['spec_score'], config.FOCAL_GAMMA, self.spec_pos_weight)
+        loss_rank_aff = ranking_loss(out['aff_score'], y_aff, config.RANKING_MARGIN)
+        loss_rank_spec = ranking_loss(out['spec_score'], y_spec, config.RANKING_MARGIN)
+        loss_gap_aff = gap_hinge_loss(out['aff_score'], y_aff, config.GAP_MARGIN)
+        loss_gap_spec = gap_hinge_loss(out['spec_score'], y_spec, config.GAP_MARGIN)
+
+        zero = out['aff_score'].new_tensor(0.0)
+        loss_adv = zero
+        if config.ADVERSARIAL_WEIGHT != 0:
             disc_on_aff = self.model.run_discriminator(out['aff_latent_grl'])
             disc_on_spec = self.model.run_discriminator(out['spec_latent_grl'])
-            loss_adv = adversarial_loss(disc_on_aff, disc_on_spec)
-            loss_indep = independence_loss(out['aff_latent'], out['spec_latent'])
-            total = (loss_cls_aff + loss_cls_spec
-                    + config.RANKING_WEIGHT_AFF * loss_rank_aff + config.RANKING_WEIGHT_SPEC * loss_rank_spec
-                    + config.GAP_WEIGHT_AFF * loss_gap_aff + config.GAP_WEIGHT_SPEC * loss_gap_spec
-                    + config.ADVERSARIAL_WEIGHT * loss_adv + config.ORTHO_WEIGHT * loss_indep)
-            
-            # Pareto diversity loss (Option 3 — gated by config flag + warmup)
-            loss_pareto = tf.constant(0.0, tf.float32)
-            if config.PARETO_LOSS:
-                loss_pareto = pareto_diversity_loss(out['aff_score'], out['spec_score'])
-                total = total + config.PARETO_LOSS_WEIGHT * loss_pareto
-        
-        grads = tape.gradient(total, self.model.trainable_variables)
-        grad_aff = tape.gradient(loss_cls_aff, self.model.trainable_variables)
-        grad_spec = tape.gradient(loss_cls_spec, self.model.trainable_variables)
-        del tape
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-        
-        def flatten_grads(g):
-            flat = [tf.reshape(x, [-1]) for x in g if x is not None]
-            return tf.concat(flat, 0) if flat else tf.zeros([1])
-        cosine_sim = tf.reduce_sum(flatten_grads(grad_aff) * flatten_grads(grad_spec)) / (
-            tf.norm(flatten_grads(grad_aff)) * tf.norm(flatten_grads(grad_spec)) + 1e-8)
-        
-        acc_aff = tf.reduce_mean(tf.cast((out['aff_score'] > 0) == tf.cast(y_aff, tf.bool), tf.float32))
-        acc_spec = tf.reduce_mean(tf.cast((out['spec_score'] > 0) == tf.cast(y_spec, tf.bool), tf.float32))
+            loss_adv = self._adversarial_loss_torch(disc_on_aff, disc_on_spec)
+
+        loss_indep = zero
+        if config.ORTHO_WEIGHT != 0:
+            loss_indep = self._independence_loss_torch(out['aff_latent'], out['spec_latent'])
+
+        total = (loss_cls_aff + loss_cls_spec
+                 + config.RANKING_WEIGHT_AFF * loss_rank_aff + config.RANKING_WEIGHT_SPEC * loss_rank_spec
+                 + config.GAP_WEIGHT_AFF * loss_gap_aff + config.GAP_WEIGHT_SPEC * loss_gap_spec
+                 + config.ADVERSARIAL_WEIGHT * loss_adv + config.ORTHO_WEIGHT * loss_indep)
+
+        loss_pareto = zero
+        if config.PARETO_LOSS:
+            loss_pareto = self._pareto_diversity_loss_torch(out['aff_score'], out['spec_score'])
+            total = total + config.PARETO_LOSS_WEIGHT * loss_pareto
+
+        return {
+            'total': total,
+            'loss_cls_aff': loss_cls_aff,
+            'loss_cls_spec': loss_cls_spec,
+            'loss_rank_aff': loss_rank_aff,
+            'loss_rank_spec': loss_rank_spec,
+            'loss_gap_aff': loss_gap_aff,
+            'loss_gap_spec': loss_gap_spec,
+            'loss_adv': loss_adv,
+            'loss_indep': loss_indep,
+            'loss_pareto': loss_pareto,
+        }
+
+    def train_step_with_diagnostics(self, x, y_aff, y_spec):
+        self.model.train()
+        x = x.to(self.device, dtype=torch.float32)
+        y_aff = y_aff.to(self.device, dtype=torch.float32)
+        y_spec = y_spec.to(self.device, dtype=torch.float32)
+
+        self.optimizer.zero_grad()
+        out = self.model(x, training=True)
+        losses = self.compute_total_loss(out, y_aff, y_spec)
+
+        shared_params = self._shared_params()
+        grad_aff = torch.autograd.grad(losses['loss_cls_aff'], shared_params, retain_graph=True, allow_unused=True)
+        grad_spec = torch.autograd.grad(losses['loss_cls_spec'], shared_params, retain_graph=True, allow_unused=True)
+        flat_aff = self._flatten_grads(grad_aff, shared_params)
+        flat_spec = self._flatten_grads(grad_spec, shared_params)
+        cosine_sim = (flat_aff * flat_spec).sum() / (torch.norm(flat_aff) * torch.norm(flat_spec) + 1e-8)
+
+        losses['total'].backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        acc_aff = ((out['aff_score'] > 0) == (y_aff > 0.5)).float().mean()
+        acc_spec = ((out['spec_score'] > 0) == (y_spec > 0.5)).float().mean()
         
         return {
-            'loss_total': float(total), 'loss_cls_aff': float(loss_cls_aff), 'loss_cls_spec': float(loss_cls_spec),
-            'loss_rank_aff': float(loss_rank_aff), 'loss_rank_spec': float(loss_rank_spec),
-            'loss_gap_aff': float(loss_gap_aff), 'loss_gap_spec': float(loss_gap_spec),
-            'loss_adv': float(loss_adv), 'loss_indep': float(loss_indep),
-            'acc_aff': float(acc_aff), 'acc_spec': float(acc_spec),
-            'aff_gap': float(safe_gap(out['aff_score'], y_aff)),
-            'spec_gap': float(safe_gap(out['spec_score'], y_spec)),
-            'latent_correlation': float(tf.abs(tfp_correlation(tf.reshape(out['aff_latent'], [-1]),
-                                                                tf.reshape(out['spec_latent'], [-1])))),
-            'dead_neurons_aff': int(tf.reduce_sum(tf.cast(tf.math.reduce_variance(out['aff_latent'], 0) < 1e-6, tf.int32))),
-            'dead_neurons_spec': int(tf.reduce_sum(tf.cast(tf.math.reduce_variance(out['spec_latent'], 0) < 1e-6, tf.int32))),
-            'grad_cosine_aff_spec': float(cosine_sim),
-            'aff_score_mean': float(tf.reduce_mean(out['aff_score'])),
-            'spec_score_mean': float(tf.reduce_mean(out['spec_score'])),
-            'loss_pareto': float(loss_pareto),
+            'loss_total': float(losses['total'].detach().cpu()),
+            'loss_cls_aff': float(losses['loss_cls_aff'].detach().cpu()),
+            'loss_cls_spec': float(losses['loss_cls_spec'].detach().cpu()),
+            'loss_rank_aff': float(losses['loss_rank_aff'].detach().cpu()),
+            'loss_rank_spec': float(losses['loss_rank_spec'].detach().cpu()),
+            'loss_gap_aff': float(losses['loss_gap_aff'].detach().cpu()),
+            'loss_gap_spec': float(losses['loss_gap_spec'].detach().cpu()),
+            'loss_adv': float(losses['loss_adv'].detach().cpu()),
+            'loss_indep': float(losses['loss_indep'].detach().cpu()),
+            'acc_aff': float(acc_aff.detach().cpu()),
+            'acc_spec': float(acc_spec.detach().cpu()),
+            'aff_gap': float(self._safe_gap_torch(out['aff_score'].detach(), y_aff).cpu()),
+            'spec_gap': float(self._safe_gap_torch(out['spec_score'].detach(), y_spec).cpu()),
+            'latent_correlation': float(torch.abs(self._correlation_torch(out['aff_latent'].detach(), out['spec_latent'].detach())).cpu()),
+            'dead_neurons_aff': int((out['aff_latent'].detach().var(dim=0, unbiased=False) < 1e-6).sum().cpu()),
+            'dead_neurons_spec': int((out['spec_latent'].detach().var(dim=0, unbiased=False) < 1e-6).sum().cpu()),
+            'grad_cosine_aff_spec': float(cosine_sim.detach().cpu()),
+            'aff_score_mean': float(out['aff_score'].detach().mean().cpu()),
+            'spec_score_mean': float(out['spec_score'].detach().mean().cpu()),
+            'loss_pareto': float(losses['loss_pareto'].detach().cpu()),
         }
     
     def create_dataset(self, X, y_aff, y_spec, batch_size, shuffle=True):
-        ds = tf.data.Dataset.from_tensor_slices((tf.cast(X, tf.float32), tf.cast(y_aff, tf.int64), tf.cast(y_spec, tf.int64)))
-        if shuffle:
-            ds = ds.shuffle(len(X), seed=SEED, reshuffle_each_iteration=True)
-        ds = ds.batch(batch_size, drop_remainder=False)
-        opts = tf.data.Options(); opts.deterministic = True
-        return ds.with_options(opts).prefetch(1)
+        dataset = TensorDataset(torch.FloatTensor(X), torch.FloatTensor(y_aff), torch.FloatTensor(y_spec))
+        generator = torch.Generator()
+        generator.manual_seed(SEED)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, generator=generator)
     
     def fit(self, X, y_aff, y_spec, epochs=25, batch_size=64,
             X_iso=None, y_iso_aff=None, y_iso_spec=None,
@@ -704,13 +811,17 @@ class DiagnosticTrainer:
             
             if (epoch + 1) % config.GEN_EVAL_EVERY == 0 or epoch == epochs - 1:
                 if X_iso is not None:
-                    out_iso = self.model(tf.constant(X_iso, tf.float32), training=False)
-                    diag.iso_aff_rho, _ = stats.spearmanr(out_iso['aff_score'].numpy(), y_iso_aff)
-                    diag.iso_spec_rho, _ = stats.spearmanr(out_iso['spec_score'].numpy(), y_iso_spec)
+                    self.model.eval()
+                    with torch.no_grad():
+                        out_iso = self.model(torch.as_tensor(X_iso, dtype=torch.float32, device=self.device), training=False)
+                    diag.iso_aff_rho, _ = stats.spearmanr(out_iso['aff_score'].detach().cpu().numpy(), y_iso_aff)
+                    diag.iso_spec_rho, _ = stats.spearmanr(out_iso['spec_score'].detach().cpu().numpy(), y_iso_spec)
                 if X_igg is not None:
-                    out_igg = self.model(tf.constant(X_igg, tf.float32), training=False)
-                    diag.igg_aff_rho, _ = stats.spearmanr(out_igg['aff_score'].numpy()[:42], y_igg_aff[:42])
-                    diag.igg_spec_rho, _ = stats.spearmanr(out_igg['spec_score'].numpy()[:42], y_igg_spec[:42])
+                    self.model.eval()
+                    with torch.no_grad():
+                        out_igg = self.model(torch.as_tensor(X_igg, dtype=torch.float32, device=self.device), training=False)
+                    diag.igg_aff_rho, _ = stats.spearmanr(out_igg['aff_score'].detach().cpu().numpy()[:42], y_igg_aff[:42])
+                    diag.igg_spec_rho, _ = stats.spearmanr(out_igg['spec_score'].detach().cpu().numpy()[:42], y_igg_spec[:42])
             
             self.epoch_diagnostics.append(diag)
             if verbose and ((epoch + 1) % 5 == 0 or epoch == 0):
@@ -726,33 +837,44 @@ class MOLMSingleTaskTrainer:
     def __init__(self, model, task='affinity', aff_pos_weight=1.0, spec_pos_weight=1.0,
                  learning_rate=5e-5, ranking_weight=0.3, gap_weight=0.2,
                  focal_gamma=2.0, ranking_margin=0.3, gap_margin=0.2):
-        self.model = model; self.task = task
+        self.device = get_device()
+        self.model = model.to(self.device); self.task = task
         self.aff_pos_weight = aff_pos_weight; self.spec_pos_weight = spec_pos_weight
         self.focal_gamma = focal_gamma; self.ranking_margin = ranking_margin
         self.gap_margin = gap_margin; self.ranking_weight = ranking_weight; self.gap_weight = gap_weight
-        self.optimizer = keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=1e-4, clipnorm=1.0)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
-    @tf.function
     def train_step(self, x, y_aff, y_spec):
-        with tf.GradientTape() as tape:
-            out = self.model(x, training=True)
-            score = out['aff_score'] if self.task == 'affinity' else out['spec_score']
-            labels = y_aff if self.task == 'affinity' else y_spec
-            pw = self.aff_pos_weight if self.task == 'affinity' else self.spec_pos_weight
-            total = (focal_bce_with_logits(labels, score, self.focal_gamma, pw)
-                     + self.ranking_weight * ranking_loss(score, labels, self.ranking_margin)
-                     + self.gap_weight * gap_hinge_loss(score, labels, self.gap_margin))
-        self.optimizer.apply_gradients(zip(tape.gradient(total, self.model.trainable_variables), self.model.trainable_variables))
+        self.model.train()
+        x = x.to(self.device, dtype=torch.float32)
+        y_aff = y_aff.to(self.device, dtype=torch.float32)
+        y_spec = y_spec.to(self.device, dtype=torch.float32)
+
+        self.optimizer.zero_grad()
+        out = self.model(x, training=True)
+        score = out['aff_score'] if self.task == 'affinity' else out['spec_score']
+        labels = y_aff if self.task == 'affinity' else y_spec
+        pw = self.aff_pos_weight if self.task == 'affinity' else self.spec_pos_weight
+        total = (focal_bce_with_logits(labels, score, self.focal_gamma, pw)
+                 + self.ranking_weight * ranking_loss(score, labels, self.ranking_margin)
+                 + self.gap_weight * gap_hinge_loss(score, labels, self.gap_margin))
+        total.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
         return total
     
     def fit(self, X, y_aff, y_spec, epochs=25, batch_size=64, verbose=0):
-        ds = tf.data.Dataset.from_tensor_slices((tf.cast(X, tf.float32), tf.cast(y_aff, tf.int64), tf.cast(y_spec, tf.int64)))
-        ds = ds.shuffle(len(X), seed=SEED, reshuffle_each_iteration=True).batch(batch_size)
-        opts = tf.data.Options(); opts.deterministic = True
-        ds = ds.with_options(opts).prefetch(1)
+        ds = TensorDataset(torch.FloatTensor(X), torch.FloatTensor(y_aff), torch.FloatTensor(y_spec))
+        generator = torch.Generator()
+        generator.manual_seed(SEED)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True, generator=generator)
         for epoch in range(epochs):
-            for x_b, ya_b, ys_b in ds:
-                self.train_step(x_b, ya_b, ys_b)
+            losses = []
+            for x_b, ya_b, ys_b in loader:
+                loss = self.train_step(x_b, ya_b, ys_b)
+                losses.append(float(loss.detach().cpu()))
+            if verbose and ((epoch + 1) % 5 == 0 or epoch == 0):
+                print(f"  ST {self.task} Ep {epoch+1:2d}/{epochs} | Loss: {np.mean(losses):.4f}")
 
 def train_molm_st(X, y_aff, y_spec, task, config_obj, aff_pos_weight=1.0, spec_pos_weight=1.0, seed_offset=0):
     hard_reset_rng(SEED + seed_offset, f"MOLM-ST {task}")
@@ -771,27 +893,69 @@ def train_molm_st(X, y_aff, y_spec, task, config_obj, aff_pos_weight=1.0, spec_p
 # ============================================================================
 # BASELINE: DeepProjectorDecider NN
 # ============================================================================
-@tf.keras.utils.register_keras_serializable()
-class DeepProjectorDecider(Model):
+class DeepProjectorDecider(nn.Module):
     def __init__(self, input_dim, intermed_dim=20, proj_dim=1, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__()
         self._input_dim = input_dim
         self._intermed_dim = intermed_dim
         self._proj_dim = proj_dim
-        self.projector = keras.Sequential([layers.InputLayer(input_shape=(input_dim,)),
-                                           layers.Dense(intermed_dim, activation='relu'), layers.Dense(proj_dim)])
-        self.decider = keras.Sequential([layers.InputLayer(input_shape=(proj_dim,)), layers.Dense(2, dtype='float32')])
+        self.projector = nn.Sequential(
+            nn.Linear(input_dim, intermed_dim),
+            nn.ReLU(),
+            nn.Linear(intermed_dim, proj_dim),
+        )
+        self.decider = nn.Linear(proj_dim, 2)
+        self.to(get_device())
+
+    def _coerce_input(self, x):
+        device = next(self.parameters()).device
+        if torch.is_tensor(x):
+            return x.to(device=device, dtype=torch.float32)
+        return torch.as_tensor(x, dtype=torch.float32, device=device)
     
-    def call(self, x, training=None):
+    def forward(self, x, training=None):
+        x = self._coerce_input(x)
         return self.decider(self.projector(x))
     
     def get_projection(self, x):
-        return self.projector(x)
+        self.eval()
+        with torch.no_grad():
+            return self.projector(self._coerce_input(x)).detach().cpu()
     
     def get_config(self):
-        base = super().get_config()
-        base.update({'input_dim': self._input_dim, 'intermed_dim': self._intermed_dim, 'proj_dim': self._proj_dim})
-        return base
+        return {'input_dim': self._input_dim, 'intermed_dim': self._intermed_dim, 'proj_dim': self._proj_dim}
+
+def train_deep_projector_decider(X_train, y_train, input_dim=None, intermed_dim=20,
+                                 proj_dim=1, epochs=50, batch_size=50, seed=SEED,
+                                 learning_rate=1e-3):
+    if input_dim is None:
+        input_dim = X_train.shape[1]
+    device = get_device()
+    model = DeepProjectorDecider(input_dim=input_dim, intermed_dim=intermed_dim,
+                                 proj_dim=proj_dim).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    loss_fn = nn.CrossEntropyLoss()
+    dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
+    model.train()
+    for _ in range(epochs):
+        for x_b, y_b in loader:
+            x_b = x_b.to(device)
+            y_b = y_b.to(device)
+            optimizer.zero_grad()
+            loss = loss_fn(model(x_b), y_b)
+            loss.backward()
+            optimizer.step()
+    return model
+
+def predict_deep_projector_logits(model, X):
+    device = next(model.parameters()).device
+    model.eval()
+    with torch.no_grad():
+        logits = model(torch.as_tensor(X, dtype=torch.float32, device=device))
+    return logits.detach().cpu().numpy()
 
 # ============================================================================
 # SAVE/LOAD HELPERS
@@ -825,4 +989,4 @@ def save_results_json(results_dict, name):
 print("✓ Phase 0 loaded: Config, models, utilities ready")
 print(f"  OUTPUT_DIR: {config.OUTPUT_DIR}")
 print(f"  FEATURE_TYPES: {config.FEATURE_TYPES}")
-print(f"  GPU: {len(gpus)} available")
+print(f"  GPU: {torch.cuda.device_count()} available")

@@ -58,6 +58,15 @@ def plot_paper_diagnostics(trainer, save_path):
     
     plt.tight_layout(); plt.savefig(save_path, dpi=200, bbox_inches="tight"); plt.show(); plt.close()
 
+def predict_model(model, X):
+    device = next(model.parameters()).device
+    model.eval()
+    with torch.no_grad():
+        return model(torch.as_tensor(X, dtype=torch.float32, device=device))
+
+def tensor_to_numpy(x):
+    return x.detach().cpu().numpy()
+
 def kfold_cv_molm(X, y_aff, y_spec, feat_label='', n_folds=5,
                   aff_pos_weight=1.0, spec_pos_weight=1.0,
                   X_iso=None, y_iso_aff=None, y_iso_spec=None,
@@ -90,23 +99,27 @@ def kfold_cv_molm(X, y_aff, y_spec, feat_label='', n_folds=5,
         if config.SAVE_PAPER_FIG:
             plot_paper_diagnostics(trainer, os.path.join(config.OUTPUT_DIR, f"paper_diag_fold_{fold+1}{fs}.png"))
         
-        out = model(tf.constant(X[val_idx], tf.float32), training=False)
-        pred_a = (out['aff_score'].numpy() > 0).astype(int)
-        pred_s = (out['spec_score'].numpy() > 0).astype(int)
+        out = predict_model(model, X[val_idx])
+        aff_score = tensor_to_numpy(out['logit_aff'])
+        spec_score = tensor_to_numpy(out['logit_spec'])
+        aff_prob = tensor_to_numpy(out['aff_prob'])
+        spec_prob = tensor_to_numpy(out['spec_prob'])
+        pred_a = (aff_score > 0).astype(int)
+        pred_s = (spec_score > 0).astype(int)
         ya_v, ys_v = y_aff[val_idx], y_spec[val_idx]
         
         results['affinity_accs'].append((pred_a == ya_v).mean())
         results['specificity_accs'].append((pred_s == ys_v).mean())
-        results['aff_aucs'].append(safe_auc(ya_v, out['aff_prob'].numpy()))
-        results['spec_aucs'].append(safe_auc(ys_v, out['spec_prob'].numpy()))
-        results['aff_aps'].append(safe_auc(ya_v, out['aff_prob'].numpy(), 'pr'))
-        results['spec_aps'].append(safe_auc(ys_v, out['spec_prob'].numpy(), 'pr'))
+        results['aff_aucs'].append(safe_auc(ya_v, aff_prob))
+        results['spec_aucs'].append(safe_auc(ys_v, spec_prob))
+        results['aff_aps'].append(safe_auc(ya_v, aff_prob, 'pr'))
+        results['spec_aps'].append(safe_auc(ys_v, spec_prob, 'pr'))
         results['aff_mccs'].append(safe_mcc(ya_v, pred_a))
         results['spec_mccs'].append(safe_mcc(ys_v, pred_s))
         
         print(f"    Aff: {results['affinity_accs'][-1]:.4f} AUC:{results['aff_aucs'][-1]:.4f} MCC:{results['aff_mccs'][-1]:.3f}")
         print(f"    Spec: {results['specificity_accs'][-1]:.4f} AUC:{results['spec_aucs'][-1]:.4f} MCC:{results['spec_mccs'][-1]:.3f}")
-        del model, trainer; tf.keras.backend.clear_session(); gc.collect()
+        del model, trainer; gc.collect(); torch.cuda.empty_cache()
     
     for k in list(results.keys()):
         results[f'{k}_mean'] = np.nanmean(results[k])
@@ -131,21 +144,25 @@ def kfold_cv_molm_st(X, y_aff, y_spec, feat_label='', n_folds=5,
     for fold, (tr, va) in enumerate(skf.split(X, y_joint)):
         # Affinity model
         m_a = train_molm_st(X[tr], y_aff[tr], y_spec[tr], 'affinity', config, aff_pos_weight, spec_pos_weight, 500+fold)
-        out_a = m_a(tf.constant(X[va], tf.float32), training=False)
-        pred_a = (out_a['aff_score'].numpy() > 0).astype(int)
+        out_a = predict_model(m_a, X[va])
+        aff_score = tensor_to_numpy(out_a['logit_aff'])
+        aff_prob = tensor_to_numpy(out_a['aff_prob'])
+        pred_a = (aff_score > 0).astype(int)
         aff_accs.append((pred_a == y_aff[va]).mean())
         aff_mccs.append(safe_mcc(y_aff[va], pred_a))
-        aff_aucs.append(safe_auc(y_aff[va], out_a['aff_prob'].numpy()))
-        del m_a; tf.keras.backend.clear_session(); gc.collect()
+        aff_aucs.append(safe_auc(y_aff[va], aff_prob))
+        del m_a; gc.collect(); torch.cuda.empty_cache()
         
         # Specificity model
         m_s = train_molm_st(X[tr], y_aff[tr], y_spec[tr], 'specificity', config, aff_pos_weight, spec_pos_weight, 600+fold)
-        out_s = m_s(tf.constant(X[va], tf.float32), training=False)
-        pred_s = (out_s['spec_score'].numpy() > 0).astype(int)
+        out_s = predict_model(m_s, X[va])
+        spec_score = tensor_to_numpy(out_s['logit_spec'])
+        spec_prob = tensor_to_numpy(out_s['spec_prob'])
+        pred_s = (spec_score > 0).astype(int)
         spec_accs.append((pred_s == y_spec[va]).mean())
         spec_mccs.append(safe_mcc(y_spec[va], pred_s))
-        spec_aucs.append(safe_auc(y_spec[va], out_s['spec_prob'].numpy()))
-        del m_s; tf.keras.backend.clear_session(); gc.collect()
+        spec_aucs.append(safe_auc(y_spec[va], spec_prob))
+        del m_s; gc.collect(); torch.cuda.empty_cache()
         
         print(f"  Fold {fold+1}: Aff {aff_accs[-1]:.4f} MCC:{aff_mccs[-1]:.3f} AUC:{aff_aucs[-1]:.4f} | Spec {spec_accs[-1]:.4f} MCC:{spec_mccs[-1]:.3f} AUC:{spec_aucs[-1]:.4f}")
     

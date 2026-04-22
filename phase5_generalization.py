@@ -16,6 +16,15 @@ except NameError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else "/kaggle/working")
     from phase0_config import *
 
+def predict_model(model, X):
+    device = next(model.parameters()).device
+    model.eval()
+    with torch.no_grad():
+        return model(torch.as_tensor(X, dtype=torch.float32, device=device))
+
+def tensor_to_numpy(x):
+    return x.detach().cpu().numpy()
+
 def evaluate_generalization(model, features, model_type='molm', feature_type='fusion_esm2'):
     fl = FEAT_LABELS.get(feature_type, feature_type)
     print(f"\n  📈 Generalization ({model_type}, {fl})...")
@@ -31,19 +40,21 @@ def evaluate_generalization(model, features, model_type='molm', feature_type='fu
         y_spec = features[ds_key][feature_type][2][:n_eval]
         
         if model_type == 'molm':
-            out = model(tf.constant(X, tf.float32), training=False)
-            pred_aff, pred_spec = out['aff_score'].numpy().flatten(), out['spec_score'].numpy().flatten()
+            out = predict_model(model, X)
+            pred_aff = tensor_to_numpy(out['logit_aff']).flatten()
+            pred_spec = tensor_to_numpy(out['logit_spec']).flatten()
         elif model_type == 'molm_st':
-            out_a = model['affinity'](tf.constant(X, tf.float32), training=False)
-            out_s = model['specificity'](tf.constant(X, tf.float32), training=False)
-            pred_aff, pred_spec = out_a['aff_score'].numpy().flatten(), out_s['spec_score'].numpy().flatten()
+            out_a = predict_model(model['affinity'], X)
+            out_s = predict_model(model['specificity'], X)
+            pred_aff = tensor_to_numpy(out_a['logit_aff']).flatten()
+            pred_spec = tensor_to_numpy(out_s['logit_spec']).flatten()
         elif model_type == 'lda':
             X_oh = features[ds_key][feature_type][0][:n_eval]
             pred_aff = model['lda_aff'].transform(X_oh).flatten()
             pred_spec = model['lda_spec'].transform(X_oh).flatten()
         elif model_type == 'nn':
-            pred_aff = model['aff'].get_projection(X).numpy().flatten()
-            pred_spec = model['spec'].get_projection(X).numpy().flatten()
+            pred_aff = tensor_to_numpy(model['aff'].get_projection(X)).flatten()
+            pred_spec = tensor_to_numpy(model['spec'].get_projection(X)).flatten()
         
         rho_aff, p_aff = stats.spearmanr(pred_aff, y_aff)
         rho_spec, p_spec = stats.spearmanr(pred_spec, y_spec)
@@ -106,18 +117,18 @@ def pareto_analysis(features, molm_model, molm_st_models=None, lda_models=None,
             return aff_s, spec_s
         
         # ---- MOLM: all 3 score types ----
-        out = molm_model(tf.constant(X, tf.float32), training=False)
+        out = predict_model(molm_model, X)
         
         for score_type in config.PARETO_SCORE_TYPES:
             if score_type == 'logits':
-                aff_s = out['aff_score'].numpy().flatten()
-                spec_s = out['spec_score'].numpy().flatten()
+                aff_s = tensor_to_numpy(out['logit_aff']).flatten()
+                spec_s = tensor_to_numpy(out['logit_spec']).flatten()
             elif score_type == 'probs':
-                aff_s = out['aff_prob'].numpy().flatten()
-                spec_s = out['spec_prob'].numpy().flatten()
+                aff_s = tensor_to_numpy(out['aff_prob']).flatten()
+                spec_s = tensor_to_numpy(out['spec_prob']).flatten()
             elif score_type == 'latent_pca':
-                aff_lat = out['aff_latent'].numpy()
-                spec_lat = out['spec_latent'].numpy()
+                aff_lat = tensor_to_numpy(out['z_aff'])
+                spec_lat = tensor_to_numpy(out['z_spec'])
                 pca_a = PCA(n_components=1).fit_transform(aff_lat).flatten()
                 pca_s = PCA(n_components=1).fit_transform(spec_lat).flatten()
                 # Align PCA direction with ground truth
@@ -129,19 +140,19 @@ def pareto_analysis(features, molm_model, molm_st_models=None, lda_models=None,
         
         # ---- MOLM-ST: all 3 score types ----
         if molm_st_models:
-            out_a = molm_st_models['affinity'](tf.constant(X, tf.float32), training=False)
-            out_s = molm_st_models['specificity'](tf.constant(X, tf.float32), training=False)
+            out_a = predict_model(molm_st_models['affinity'], X)
+            out_s = predict_model(molm_st_models['specificity'], X)
             
             for score_type in config.PARETO_SCORE_TYPES:
                 if score_type == 'logits':
-                    aff_s = out_a['aff_score'].numpy().flatten()
-                    spec_s = out_s['spec_score'].numpy().flatten()
+                    aff_s = tensor_to_numpy(out_a['logit_aff']).flatten()
+                    spec_s = tensor_to_numpy(out_s['logit_spec']).flatten()
                 elif score_type == 'probs':
-                    aff_s = out_a['aff_prob'].numpy().flatten()
-                    spec_s = out_s['spec_prob'].numpy().flatten()
+                    aff_s = tensor_to_numpy(out_a['aff_prob']).flatten()
+                    spec_s = tensor_to_numpy(out_s['spec_prob']).flatten()
                 elif score_type == 'latent_pca':
-                    pca_a = PCA(1).fit_transform(out_a['aff_latent'].numpy()).flatten()
-                    pca_s = PCA(1).fit_transform(out_s['spec_latent'].numpy()).flatten()
+                    pca_a = PCA(1).fit_transform(tensor_to_numpy(out_a['z_aff'])).flatten()
+                    pca_s = PCA(1).fit_transform(tensor_to_numpy(out_s['z_spec'])).flatten()
                     if stats.spearmanr(pca_a, y_aff)[0] < 0: pca_a = -pca_a
                     if stats.spearmanr(pca_s, y_spec)[0] > 0: pca_s = -pca_s
                     aff_s, spec_s = pca_a, pca_s
@@ -160,8 +171,8 @@ def pareto_analysis(features, molm_model, molm_st_models=None, lda_models=None,
                 ft = nn_pair.get('feature_type', 'onehot')
                 if ft in features[ds_key]:
                     X_nn = features[ds_key][ft][0][:n_eval]
-                    eval_pareto(nn_name, nn_pair['aff'].get_projection(X_nn).numpy().flatten(),
-                                nn_pair['spec'].get_projection(X_nn).numpy().flatten())
+                    eval_pareto(nn_name, tensor_to_numpy(nn_pair['aff'].get_projection(X_nn)).flatten(),
+                                tensor_to_numpy(nn_pair['spec'].get_projection(X_nn)).flatten())
         
         all_results[ds_name] = ds_results
     
@@ -187,13 +198,13 @@ def plot_pareto_diagnostics(features, molm_model, molm_st_models=None, feature_t
         y_spec = features[ds_key][feature_type][2][:n_eval]
         true_pareto = compute_pareto_front(y_aff, -y_spec)
         
-        out = molm_model(tf.constant(X, tf.float32), training=False)
-        aff_logit = out['aff_score'].numpy().flatten()
-        spec_logit = out['spec_score'].numpy().flatten()
-        aff_prob = out['aff_prob'].numpy().flatten()
-        spec_prob = out['spec_prob'].numpy().flatten()
-        aff_lat = out['aff_latent'].numpy()
-        spec_lat = out['spec_latent'].numpy()
+        out = predict_model(molm_model, X)
+        aff_logit = tensor_to_numpy(out['logit_aff']).flatten()
+        spec_logit = tensor_to_numpy(out['logit_spec']).flatten()
+        aff_prob = tensor_to_numpy(out['aff_prob']).flatten()
+        spec_prob = tensor_to_numpy(out['spec_prob']).flatten()
+        aff_lat = tensor_to_numpy(out['z_aff'])
+        spec_lat = tensor_to_numpy(out['z_spec'])
         
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
         fig.suptitle(f"Pareto Diagnostics — MOLM on {ds_name} (n={n_eval})", fontsize=14, fontweight='bold')
@@ -280,12 +291,14 @@ def plot_pareto_diagnostics(features, molm_model, molm_st_models=None, feature_t
             y_spec = features[ds_key][feature_type][2][:n_eval]
             true_p = compute_pareto_front(y_aff, -y_spec)
             
-            out_m = molm_model(tf.constant(X, tf.float32), training=False)
-            out_a = molm_st_models['affinity'](tf.constant(X, tf.float32), training=False)
-            out_s = molm_st_models['specificity'](tf.constant(X, tf.float32), training=False)
+            out_m = predict_model(molm_model, X)
+            out_a = predict_model(molm_st_models['affinity'], X)
+            out_s = predict_model(molm_st_models['specificity'], X)
             
-            ma, ms = out_m['aff_prob'].numpy().flatten(), out_m['spec_prob'].numpy().flatten()
-            sa, ss = out_a['aff_prob'].numpy().flatten(), out_s['spec_prob'].numpy().flatten()
+            ma = tensor_to_numpy(out_m['aff_prob']).flatten()
+            ms = tensor_to_numpy(out_m['spec_prob']).flatten()
+            sa = tensor_to_numpy(out_a['aff_prob']).flatten()
+            ss = tensor_to_numpy(out_s['spec_prob']).flatten()
             
             ax.scatter(ma, ms, alpha=0.5, s=25, c='#3498db', label=f'MOLM (r={np.corrcoef(ma,ms)[0,1]:.2f})')
             ax.scatter(sa, ss, alpha=0.5, s=25, c='#e74c3c', marker='^', label=f'MOLM-ST (r={np.corrcoef(sa,ss)[0,1]:.2f})')

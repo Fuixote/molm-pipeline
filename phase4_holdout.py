@@ -15,6 +15,15 @@ except NameError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else "/kaggle/working")
     from phase0_config import *
 
+def predict_model(model, X):
+    device = next(model.parameters()).device
+    model.eval()
+    with torch.no_grad():
+        return model(torch.as_tensor(X, dtype=torch.float32, device=device))
+
+def tensor_to_numpy(x):
+    return x.detach().cpu().numpy()
+
 def held_out_site_evaluation(features, mode='top', epochs=None, latent_dim=None,
                               nn_epochs=50, nn_intermed_dim=20):
     if epochs is None: epochs = config.EPOCHS
@@ -32,7 +41,6 @@ def held_out_site_evaluation(features, mode='top', epochs=None, latent_dim=None,
     emi_binding = features['emi']['binding']
     aff_pos_weight = features['emi']['aff_pos_weight']
     spec_pos_weight = features['emi']['spec_pos_weight']
-    loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     
     print(f"\n🧬 Held-out evaluation ({mode_name})...")
     print(f"  Sites: {config.MUTATION_SITES_KABAT}, Primary: {primary_label}")
@@ -69,15 +77,19 @@ def held_out_site_evaluation(features, mode='top', epochs=None, latent_dim=None,
             trainer = DiagnosticTrainer(model, aff_pos_weight=aff_pos_weight,
                                         spec_pos_weight=spec_pos_weight, learning_rate=config.LEARNING_RATE)
             trainer.fit(X_feat[train_idx], ya_tr, ys_tr, epochs=epochs, batch_size=config.BATCH_SIZE, verbose=0)
-            out = model(tf.constant(X_feat[test_idx], tf.float32), training=False)
-            m_pa = (out['aff_score'].numpy() > 0).astype(np.int64)
-            m_ps = (out['spec_score'].numpy() > 0).astype(np.int64)
-            del model, trainer; tf.keras.backend.clear_session(); gc.collect()
+            out = predict_model(model, X_feat[test_idx])
+            aff_score = tensor_to_numpy(out['logit_aff'])
+            spec_score = tensor_to_numpy(out['logit_spec'])
+            aff_prob = tensor_to_numpy(out['aff_prob'])
+            spec_prob = tensor_to_numpy(out['spec_prob'])
+            m_pa = (aff_score > 0).astype(np.int64)
+            m_ps = (spec_score > 0).astype(np.int64)
+            del model, trainer; gc.collect(); torch.cuda.empty_cache()
             
             mk = f'molm_{feat_type}'
             for suffix, val in [('_affinity_accs', (m_pa==ya_te).mean()), ('_specificity_accs', (m_ps==ys_te).mean()),
-                                ('_aff_aucs', safe_auc(ya_te, out['aff_prob'].numpy())),
-                                ('_spec_aucs', safe_auc(ys_te, out['spec_prob'].numpy())),
+                                ('_aff_aucs', safe_auc(ya_te, aff_prob)),
+                                ('_spec_aucs', safe_auc(ys_te, spec_prob)),
                                 ('_aff_mccs', safe_mcc(ya_te, m_pa)), ('_spec_mccs', safe_mcc(ys_te, m_ps))]:
                 results.setdefault(mk+suffix, []).append(val)
             
@@ -91,15 +103,15 @@ def held_out_site_evaluation(features, mode='top', epochs=None, latent_dim=None,
             if config.RUN_MOLM_ST:
                 st_a = train_molm_st(X_feat[train_idx], ya_tr, ys_tr, 'affinity', config,
                                      aff_pos_weight, spec_pos_weight, i+500+fi*100)
-                out_a = st_a(tf.constant(X_feat[test_idx], tf.float32), training=False)
-                st_pa = (out_a['aff_score'].numpy() > 0).astype(np.int64)
-                del st_a; tf.keras.backend.clear_session(); gc.collect()
+                out_a = predict_model(st_a, X_feat[test_idx])
+                st_pa = (tensor_to_numpy(out_a['logit_aff']) > 0).astype(np.int64)
+                del st_a; gc.collect(); torch.cuda.empty_cache()
                 
                 st_s = train_molm_st(X_feat[train_idx], ya_tr, ys_tr, 'specificity', config,
                                      aff_pos_weight, spec_pos_weight, i+600+fi*100)
-                out_s = st_s(tf.constant(X_feat[test_idx], tf.float32), training=False)
-                st_ps = (out_s['spec_score'].numpy() > 0).astype(np.int64)
-                del st_s; tf.keras.backend.clear_session(); gc.collect()
+                out_s = predict_model(st_s, X_feat[test_idx])
+                st_ps = (tensor_to_numpy(out_s['logit_spec']) > 0).astype(np.int64)
+                del st_s; gc.collect(); torch.cuda.empty_cache()
                 
                 sk = f'molm_st_{feat_type}'
                 for suffix, val in [('_affinity_accs', (st_pa==ya_te).mean()), ('_specificity_accs', (st_ps==ys_te).mean()),
@@ -119,14 +131,18 @@ def held_out_site_evaluation(features, mode='top', epochs=None, latent_dim=None,
             fl = FEAT_LABELS.get(nn_ft, nn_ft)
             
             hard_reset_rng(SEED + i*100 + seed_base, f"NN-{fl} site {kabat_pos} aff")
-            nn_a = DeepProjectorDecider(input_dim=nn_X.shape[1], intermed_dim=nn_intermed_dim)
-            nn_a.compile(optimizer='adam', loss=loss_fn); nn_a.fit(nn_X[train_idx], ya_tr, epochs=nn_epochs, batch_size=50, shuffle=True, verbose=0)
-            nn_pa = np.argmax(nn_a(nn_X[test_idx]), 1); del nn_a; tf.keras.backend.clear_session()
+            nn_a = train_deep_projector_decider(
+                nn_X[train_idx], ya_tr, input_dim=nn_X.shape[1], intermed_dim=nn_intermed_dim,
+                epochs=nn_epochs, batch_size=50, seed=SEED + i*100 + seed_base)
+            nn_logits_a = predict_deep_projector_logits(nn_a, nn_X[test_idx])
+            nn_pa = np.argmax(nn_logits_a, 1); del nn_a; gc.collect(); torch.cuda.empty_cache()
             
             hard_reset_rng(SEED + i*100 + seed_base + 50, f"NN-{fl} site {kabat_pos} spec")
-            nn_s = DeepProjectorDecider(input_dim=nn_X.shape[1], intermed_dim=nn_intermed_dim)
-            nn_s.compile(optimizer='adam', loss=loss_fn); nn_s.fit(nn_X[train_idx], ys_tr, epochs=nn_epochs, batch_size=50, shuffle=True, verbose=0)
-            nn_ps = np.argmax(nn_s(nn_X[test_idx]), 1); del nn_s; tf.keras.backend.clear_session()
+            nn_s = train_deep_projector_decider(
+                nn_X[train_idx], ys_tr, input_dim=nn_X.shape[1], intermed_dim=nn_intermed_dim,
+                epochs=nn_epochs, batch_size=50, seed=SEED + i*100 + seed_base + 50)
+            nn_logits_s = predict_deep_projector_logits(nn_s, nn_X[test_idx])
+            nn_ps = np.argmax(nn_logits_s, 1); del nn_s; gc.collect(); torch.cuda.empty_cache()
             
             nn_preds[nn_ft] = (nn_pa, nn_ps)
             nk = f'nn_{nn_ft}'
