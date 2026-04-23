@@ -87,9 +87,16 @@ def load_all_data():
     
     # ESM-2
     if config.USE_ESM2:
-        esm2_files = {k: os.path.join(config.ESM2_DIR, f"{k}.csv") for k in ['emi_esm2', 'iso_esm2', 'igg_esm2']}
+        default_esm2_files = {k: os.path.join(config.ESM2_DIR, f"{k}.csv") for k in ['emi_esm2', 'iso_esm2', 'igg_esm2']}
+        legacy_esm2_dir = os.path.join(config.OUTPUT_DIR, "esm2")
+        legacy_esm2_files = {k: os.path.join(legacy_esm2_dir, f"{k}.csv") for k in default_esm2_files}
+        esm2_files = default_esm2_files
+        cache_source = config.ESM2_DIR
+        if not all(os.path.exists(f) for f in default_esm2_files.values()) and all(os.path.exists(f) for f in legacy_esm2_files.values()):
+            esm2_files = legacy_esm2_files
+            cache_source = legacy_esm2_dir
         if all(os.path.exists(f) for f in esm2_files.values()):
-            print("  Loading cached ESM-2...")
+            print(f"  Loading cached ESM-2 from: {cache_source}")
             for k in esm2_files:
                 data[k] = pd.read_csv(esm2_files[k], header=0, index_col=0)
             data['has_esm2'] = True
@@ -97,7 +104,7 @@ def load_all_data():
         else:
             print("  Computing ESM-2 embeddings...")
             try:
-                data['has_esm2'] = _compute_and_cache_esm2(data, esm2_files, config.ESM2_DIM)
+                data['has_esm2'] = _compute_and_cache_esm2(data, default_esm2_files, config.ESM2_DIM)
             except Exception as e:
                 print(f"  ✗ ESM-2 failed: {e}. Falling back to UniRep.")
                 data['has_esm2'] = False

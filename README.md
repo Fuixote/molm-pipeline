@@ -44,11 +44,11 @@ The pipeline is organized into 6 sequential phase files designed to run locally 
 | Phase | File | Description | Output | Runtime |
 |-------|------|-------------|--------|---------|
 | 0 | `phase0_config.py` | Configuration, model definitions, loss functions, metrics | — | Instant |
-| 1 | `phase1_features.py` | Data loading, ESM-2 embedding computation | `features.pkl` | ~5 min |
-| 2 | `phase2_baselines.py` | LDA + NN baselines (5-fold CV with AUC-ROC) | `baselines.pkl` | ~15 min |
-| 3 | `phase3_molm_cv.py` | MOLM + MOLM-ST cross-validation (full grid) | `molm_cv.pkl` | ~3 hrs |
-| 4 | `phase4_holdout.py` | Mutation-site holdout evaluation (8 sites × all models) | `holdout.pkl` | ~8 hrs |
-| 5 | `phase5_generalization.py` | Cross-platform generalization + Pareto-front recovery | `generalization.pkl` | ~1.5 hrs |
+| 1 | `phase1_features.py` | Data loading, ESM-2 embedding computation | `outputs/phase1/features.pkl` | ~5 min |
+| 2 | `phase2_baselines.py` | LDA + NN baselines (5-fold CV with AUC-ROC) | `outputs/phase2/baselines.pkl` | ~15 min |
+| 3 | `phase3_molm_cv.py` | MOLM + MOLM-ST cross-validation (full grid) | `outputs/phase3/molm_cv.pkl` | ~3 hrs |
+| 4 | `phase4_holdout.py` | Mutation-site holdout evaluation (8 sites × all models) | `outputs/phase4/holdout.pkl` | ~8 hrs |
+| 5 | `phase5_generalization.py` | Cross-platform generalization + Pareto-front recovery | `outputs/phase5/generalization.pkl` | ~1.5 hrs |
 
 ## Setup & Usage
 
@@ -63,7 +63,7 @@ The pipeline is organized into 6 sequential phase files designed to run locally 
 
 ### Local Configuration
 
-By default, the pipeline reads input data from `./data`, writes outputs to `./outputs`, and caches ESM-2 embeddings in `./outputs/esm2`.
+By default, the pipeline reads input data from `./data`, writes phase outputs under `./outputs/phase*/`, and caches ESM-2 embeddings in `./outputs/phase1/esm2`.
 
 You can override those locations with environment variables:
 

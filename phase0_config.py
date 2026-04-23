@@ -50,6 +50,7 @@ import json
 import sys
 import time
 import hashlib
+import io
 import pickle
 
 # ============================================================================
@@ -135,7 +136,7 @@ class Config:
     FEATURE_TYPES = ['onehot', 'esm2', 'fusion_esm2']
     GRID_FEATURE_TYPES = ['onehot', 'esm2', 'fusion_esm2']
     
-    ESM2_DIR = os.environ.get("MOLM_ESM2_DIR", os.path.join(OUTPUT_DIR, "esm2"))
+    ESM2_DIR = os.environ.get("MOLM_ESM2_DIR", os.path.join(OUTPUT_DIR, "phase1", "esm2"))
     ESM2_DIM = 320
     USE_ESM2 = True
     
@@ -157,6 +158,33 @@ FEAT_LABELS = {
     'onehot': 'OneHot', 'esm2': 'ESM2',
     'fusion_esm2': 'Fusion-ESM2', 'fusion': 'Fusion-UniRep'
 }
+
+ARTIFACT_PHASES = {
+    'features': 'phase1',
+    'baselines': 'phase2',
+    'molm_cv': 'phase3',
+    'holdout': 'phase4',
+    'generalization': 'phase5',
+}
+
+def get_phase_output_dir(phase):
+    path = os.path.join(config.OUTPUT_DIR, phase)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def phase_output_path(filename, phase):
+    return os.path.join(get_phase_output_dir(phase), filename)
+
+def get_artifact_phase(name, phase=None):
+    return phase if phase is not None else ARTIFACT_PHASES.get(name)
+
+def get_artifact_candidates(name, suffix, phase=None):
+    candidates = []
+    artifact_phase = get_artifact_phase(name, phase)
+    if artifact_phase:
+        candidates.append(phase_output_path(f"{name}{suffix}", artifact_phase))
+    candidates.append(os.path.join(config.OUTPUT_DIR, f"{name}{suffix}"))
+    return candidates
 
 def get_primary_feat(features):
     """Determine primary feature type."""
@@ -828,7 +856,8 @@ class DiagnosticTrainer:
             self.epoch_diagnostics.append(diag)
             if verbose and ((epoch + 1) % 5 == 0 or epoch == 0):
                 print(f"  Ep {epoch+1:2d}/{epochs} | Acc: {diag.acc_aff:.3f}/{diag.acc_spec:.3f} | "
-                      f"Gap: {diag.aff_gap:+.2f}/{diag.spec_gap:+.2f} | GradCos: {diag.grad_cosine_aff_spec:+.3f}")
+                      f"Gap: {diag.aff_gap:+.2f}/{diag.spec_gap:+.2f} | GradCos: {diag.grad_cosine_aff_spec:+.3f}",
+                      flush=True)
         config.PARETO_LOSS = _pareto_orig  # Restore original flag
         return self.history
 
@@ -876,9 +905,10 @@ class MOLMSingleTaskTrainer:
                 loss = self.train_step(x_b, ya_b, ys_b)
                 losses.append(float(loss.detach().cpu()))
             if verbose and ((epoch + 1) % 5 == 0 or epoch == 0):
-                print(f"  ST {self.task} Ep {epoch+1:2d}/{epochs} | Loss: {np.mean(losses):.4f}")
+                print(f"  ST {self.task} Ep {epoch+1:2d}/{epochs} | Loss: {np.mean(losses):.4f}", flush=True)
 
-def train_molm_st(X, y_aff, y_spec, task, config_obj, aff_pos_weight=1.0, spec_pos_weight=1.0, seed_offset=0):
+def train_molm_st(X, y_aff, y_spec, task, config_obj, aff_pos_weight=1.0, spec_pos_weight=1.0,
+                  seed_offset=0, verbose=0):
     hard_reset_rng(SEED + seed_offset, f"MOLM-ST {task}")
     model = DiagnosticMOLM(input_dim=X.shape[1], latent_dim=config_obj.LATENT_DIM,
                            shared_dims=config_obj.SHARED_DIMS, tower_dims=config_obj.TOWER_DIMS,
@@ -889,7 +919,8 @@ def train_molm_st(X, y_aff, y_spec, task, config_obj, aff_pos_weight=1.0, spec_p
                                      spec_pos_weight=spec_pos_weight, learning_rate=config_obj.LEARNING_RATE,
                                      ranking_weight=rw, gap_weight=gw, focal_gamma=config_obj.FOCAL_GAMMA,
                                      ranking_margin=config_obj.RANKING_MARGIN, gap_margin=config_obj.GAP_MARGIN)
-    trainer.fit(X, y_aff, y_spec, epochs=config_obj.EPOCHS, batch_size=config_obj.BATCH_SIZE)
+    trainer.fit(X, y_aff, y_spec, epochs=config_obj.EPOCHS, batch_size=config_obj.BATCH_SIZE,
+                verbose=verbose)
     return model
 
 # ============================================================================
@@ -962,28 +993,42 @@ def predict_deep_projector_logits(model, X):
 # ============================================================================
 # SAVE/LOAD HELPERS
 # ============================================================================
-def save_phase_data(data, name):
-    path = os.path.join(config.OUTPUT_DIR, f"{name}.pkl")
+def save_phase_data(data, name, phase=None):
+    artifact_phase = get_artifact_phase(name, phase)
+    path = phase_output_path(f"{name}.pkl", artifact_phase) if artifact_phase else os.path.join(config.OUTPUT_DIR, f"{name}.pkl")
     with open(path, 'wb') as f:
         pickle.dump(data, f)
     print(f"  ✓ Saved: {path}")
 
-def load_phase_data(name):
-    path = os.path.join(config.OUTPUT_DIR, f"{name}.pkl")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Phase data not found: {path}\n  Run the previous phase first.")
-    with open(path, 'rb') as f:
-        data = pickle.load(f)
-    print(f"  ✓ Loaded: {path}")
-    return data
+def _safe_pickle_load(path):
+    original_loader = torch.storage._load_from_bytes
+    map_location = get_device() if torch.cuda.is_available() else torch.device("cpu")
+    torch.storage._load_from_bytes = lambda b: torch.load(io.BytesIO(b), map_location=map_location)
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    finally:
+        torch.storage._load_from_bytes = original_loader
 
-def save_results_csv(results_dict, name):
-    path = os.path.join(config.OUTPUT_DIR, f"{name}.csv")
+def load_phase_data(name, phase=None):
+    candidates = get_artifact_candidates(name, ".pkl", phase)
+    for path in candidates:
+        if os.path.exists(path):
+            data = _safe_pickle_load(path)
+            print(f"  ✓ Loaded: {path}")
+            return data
+    expected = candidates[0]
+    raise FileNotFoundError(f"Phase data not found: {expected}\n  Run the previous phase first.")
+
+def save_results_csv(results_dict, name, phase=None):
+    artifact_phase = get_artifact_phase(name, phase)
+    path = phase_output_path(f"{name}.csv", artifact_phase) if artifact_phase else os.path.join(config.OUTPUT_DIR, f"{name}.csv")
     pd.DataFrame([results_dict]).to_csv(path, index=False)
     print(f"  ✓ Saved: {path}")
 
-def save_results_json(results_dict, name):
-    path = os.path.join(config.OUTPUT_DIR, f"{name}.json")
+def save_results_json(results_dict, name, phase=None):
+    artifact_phase = get_artifact_phase(name, phase)
+    path = phase_output_path(f"{name}.json", artifact_phase) if artifact_phase else os.path.join(config.OUTPUT_DIR, f"{name}.json")
     with open(path, 'w') as f:
         json.dump(results_dict, f, indent=2, default=str)
     print(f"  ✓ Saved: {path}")

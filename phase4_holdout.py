@@ -294,6 +294,6 @@ if __name__ == "__main__":
                     row[k] = v[si]
             rows.append(row)
         if rows:
-            pd.DataFrame(rows).to_csv(os.path.join(config.OUTPUT_DIR, f"holdout_{mode_key}.csv"), index=False)
+            pd.DataFrame(rows).to_csv(phase_output_path(f"holdout_{mode_key}.csv", "phase4"), index=False)
     
     print(f"\n✓ Phase 4 complete in {time.time()-t0:.0f}s ({(time.time()-t0)/60:.1f} min)")

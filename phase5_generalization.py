@@ -274,9 +274,9 @@ def plot_pareto_diagnostics(features, molm_model, molm_st_models=None, feature_t
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         plt.tight_layout()
-        save_path = os.path.join(config.OUTPUT_DIR, f"pareto_diagnostics_{ds_name.lower()}.png")
+        save_path = phase_output_path(f"pareto_diagnostics_{ds_name.lower()}.png", "phase5")
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
-        plt.show(); plt.close()
+        plt.close(fig)
         print(f"  ✓ Saved: {save_path}")
     
     # === MOLM vs MOLM-ST comparison plot ===
@@ -307,9 +307,9 @@ def plot_pareto_diagnostics(features, molm_model, molm_st_models=None, feature_t
             ax.legend(fontsize=8)
         
         plt.tight_layout()
-        save_path = os.path.join(config.OUTPUT_DIR, "pareto_molm_vs_st.png")
+        save_path = phase_output_path("pareto_molm_vs_st.png", "phase5")
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
-        plt.show(); plt.close()
+        plt.close(fig)
         print(f"  ✓ Saved: {save_path}")
 
 # ============================================================================
@@ -424,7 +424,7 @@ if __name__ == "__main__":
         row = {'model': model_name}
         row.update(res)
         gen_rows.append(row)
-    pd.DataFrame(gen_rows).to_csv(os.path.join(config.OUTPUT_DIR, "generalization_results.csv"), index=False)
+    pd.DataFrame(gen_rows).to_csv(phase_output_path("generalization_results.csv", "phase5"), index=False)
     
     # Print full grid
     print(f"\n{'='*85}")
