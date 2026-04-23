@@ -25,6 +25,10 @@ def predict_model(model, X):
 def tensor_to_numpy(x):
     return x.detach().cpu().numpy()
 
+def predict_nn_positive_class_score(model, X):
+    logits = predict_deep_projector_logits(model, X)
+    return torch.softmax(torch.as_tensor(logits), dim=1).numpy()[:, 1]
+
 def evaluate_generalization(model, features, model_type='molm', feature_type='fusion_esm2'):
     fl = FEAT_LABELS.get(feature_type, feature_type)
     print(f"\n  📈 Generalization ({model_type}, {fl})...")
@@ -53,8 +57,8 @@ def evaluate_generalization(model, features, model_type='molm', feature_type='fu
             pred_aff = model['lda_aff'].transform(X_oh).flatten()
             pred_spec = model['lda_spec'].transform(X_oh).flatten()
         elif model_type == 'nn':
-            pred_aff = tensor_to_numpy(model['aff'].get_projection(X)).flatten()
-            pred_spec = tensor_to_numpy(model['spec'].get_projection(X)).flatten()
+            pred_aff = predict_nn_positive_class_score(model['aff'], X)
+            pred_spec = predict_nn_positive_class_score(model['spec'], X)
         
         rho_aff, p_aff = stats.spearmanr(pred_aff, y_aff)
         rho_spec, p_spec = stats.spearmanr(pred_spec, y_spec)
@@ -171,8 +175,8 @@ def pareto_analysis(features, molm_model, molm_st_models=None, lda_models=None,
                 ft = nn_pair.get('feature_type', 'onehot')
                 if ft in features[ds_key]:
                     X_nn = features[ds_key][ft][0][:n_eval]
-                    eval_pareto(nn_name, tensor_to_numpy(nn_pair['aff'].get_projection(X_nn)).flatten(),
-                                tensor_to_numpy(nn_pair['spec'].get_projection(X_nn)).flatten())
+                    eval_pareto(nn_name, predict_nn_positive_class_score(nn_pair['aff'], X_nn),
+                                predict_nn_positive_class_score(nn_pair['spec'], X_nn))
         
         all_results[ds_name] = ds_results
     
